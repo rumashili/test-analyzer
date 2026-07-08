@@ -1,0 +1,962 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Plus, Trash2, BarChart2, Hexagon, Filter, Cloud, X, FileText, Printer, CheckSquare, Edit2, Calendar, ChevronLeft, ChevronRight } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+
+// Firebaseの初期化
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// グラフ描画用コンポーネント
+const ChartView = ({ data, type }) => {
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+  const [chartLibLoaded, setChartLibLoaded] = useState(!!window.Chart);
+
+  // Chart.js スクリプトの動的ロード
+  useEffect(() => {
+    if (window.Chart) {
+      setChartLibLoaded(true);
+      return;
+    }
+
+    const scriptId = 'chartjs-cdn-script';
+    let script = document.getElementById(scriptId);
+
+    if (!script) {
+      script = document.createElement('script');
+      script.id = scriptId;
+      script.src = 'https://cdn.jsdelivr.net/npm/chart.js';
+      script.async = true;
+      script.onload = () => {
+        setChartLibLoaded(true);
+      };
+      document.body.appendChild(script);
+    } else {
+      script.addEventListener('load', () => setChartLibLoaded(true));
+    }
+  }, []);
+
+  // グラフの描画処理
+  useEffect(() => {
+    if (!chartLibLoaded || !chartRef.current || !window.Chart) return;
+    
+    if (chartInstance.current) {
+      chartInstance.current.destroy();
+    }
+
+    const ctx = chartRef.current.getContext('2d');
+    
+    const labels = data.map(d => d.name);
+    const scores = data.map(d => d.score);
+    const averages = data.map(d => d.average);
+
+    const config = {
+      type: type === 'bar' ? 'bar' : 'radar',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: 'あなたの点数',
+            data: scores,
+            backgroundColor: type === 'bar' ? 'rgba(59, 130, 246, 0.7)' : 'rgba(59, 130, 246, 0.2)',
+            borderColor: 'rgb(59, 130, 246)',
+            borderWidth: 2,
+            pointBackgroundColor: 'rgb(59, 130, 246)',
+          },
+          {
+            label: '平均点',
+            data: averages,
+            backgroundColor: type === 'bar' ? 'rgba(239, 68, 68, 0.7)' : 'rgba(239, 68, 68, 0.2)',
+            borderColor: 'rgb(239, 68, 68)',
+            borderWidth: 2,
+            pointBackgroundColor: 'rgb(239, 68, 68)',
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'top',
+          }
+        },
+        scales: type === 'bar' ? {
+          y: { beginAtZero: true }
+        } : {
+          r: {
+            beginAtZero: true,
+            suggestedMax: 100,
+            ticks: { stepSize: 20 }
+          }
+        }
+      }
+    };
+
+    chartInstance.current = new window.Chart(ctx, config);
+
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+      }
+    };
+  }, [data, type, chartLibLoaded]);
+
+  if (data.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-gray-400 p-8 text-center">
+        <BarChart2 size={32} className="mb-2 opacity-50" />
+        <p>データがありません。<br/>科目を追加してください。</p>
+      </div>
+    );
+  }
+
+  if (!chartLibLoaded) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-gray-400 p-8 text-center">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mb-2"></div>
+        <p>グラフを準備中...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative h-full w-full min-h-[250px]">
+      <canvas ref={chartRef}></canvas>
+    </div>
+  );
+};
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [subjects, setSubjects] = useState([]);
+  const [studyPlan, setStudyPlan] = useState('');
+  const [events, setEvents] = useState([]); // カレンダーイベント
+  
+  const [selectedTag, setSelectedTag] = useState('all');
+  const [chartType, setChartType] = useState('radar');
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard', 'schedule', or 'report'
+  const [editingSubject, setEditingSubject] = useState(null); // null if not editing
+
+  // カレンダー用ステート
+  const today = new Date();
+  const [currentMonth, setCurrentMonth] = useState(new Date(today.getFullYear(), today.getMonth(), 1));
+  const [selectedDate, setSelectedDate] = useState(`${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`);
+  const [taskInput, setTaskInput] = useState('');
+
+  // 新規追加フォームステート
+  const [name, setName] = useState('');
+  const [score, setScore] = useState('');
+  const [average, setAverage] = useState('');
+  const [tagsInput, setTagsInput] = useState('');
+
+  // 編集フォームステート
+  const [editForm, setEditForm] = useState({
+    id: '', name: '', score: '', average: '', tagsInput: '', range: '', reflection: ''
+  });
+
+  // 1. Firebase 認証の初期化
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Authentication Error:", error);
+      }
+    };
+    initAuth();
+    
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      if (!u) setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // 2. データの取得 (Firestoreリスナー)
+  useEffect(() => {
+    if (!user) return;
+    
+    const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'app_data', 'scores');
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setSubjects(data.subjects || []);
+        setStudyPlan(data.studyPlan || '');
+        setEvents(data.events || []);
+      } else {
+        setSubjects([]);
+        setStudyPlan('');
+        setEvents([]);
+      }
+      setLoading(false);
+    }, (error) => {
+      console.error("Firestore Listener Error:", error);
+      setLoading(false);
+    });
+    
+    return () => unsubscribe();
+  }, [user]);
+
+  // Firestoreへの保存関数
+  const saveData = async (newSubjects, newPlan, newEvents) => {
+    if (!user) return;
+    try {
+      const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'app_data', 'scores');
+      await setDoc(docRef, { 
+        subjects: newSubjects, 
+        studyPlan: newPlan !== undefined ? newPlan : studyPlan,
+        events: newEvents !== undefined ? newEvents : events
+      });
+    } catch (error) {
+      console.error("Save Error:", error);
+    }
+  };
+
+  const handleAdd = async (e) => {
+    e.preventDefault();
+    if (!name || score === '' || average === '') return;
+    
+    const tags = tagsInput.split(/[,、\s]+/).map(t => t.trim()).filter(t => t);
+    
+    const newSubject = {
+      id: crypto.randomUUID(),
+      name,
+      score: Number(score),
+      average: Number(average),
+      tags,
+      range: '',
+      reflection: ''
+    };
+
+    const newSubjects = [...subjects, newSubject];
+    setSubjects(newSubjects);
+    await saveData(newSubjects, studyPlan, events);
+
+    setName('');
+    setScore('');
+    setAverage('');
+    setTagsInput('');
+  };
+
+  const handleDelete = async (id) => {
+    if(!window.confirm("この科目を削除しますか？")) return;
+    const newSubjects = subjects.filter(s => s.id !== id);
+    setSubjects(newSubjects);
+    await saveData(newSubjects, studyPlan, events);
+    
+    if (selectedTag !== 'all') {
+      const tagStillExists = newSubjects.some(s => s.tags.includes(selectedTag));
+      if (!tagStillExists) {
+        setSelectedTag('all');
+      }
+    }
+  };
+
+  const openEditModal = (subject) => {
+    setEditForm({
+      id: subject.id,
+      name: subject.name,
+      score: subject.score,
+      average: subject.average,
+      tagsInput: subject.tags.join(', '),
+      range: subject.range || '',
+      reflection: subject.reflection || ''
+    });
+    setEditingSubject(subject);
+  };
+
+  const handleUpdate = async (e) => {
+    e.preventDefault();
+    const tags = editForm.tagsInput.split(/[,、\s]+/).map(t => t.trim()).filter(t => t);
+    
+    const updatedSubject = {
+      ...editingSubject,
+      name: editForm.name,
+      score: Number(editForm.score),
+      average: Number(editForm.average),
+      tags,
+      range: editForm.range,
+      reflection: editForm.reflection
+    };
+
+    const newSubjects = subjects.map(s => s.id === updatedSubject.id ? updatedSubject : s);
+    setSubjects(newSubjects);
+    await saveData(newSubjects, studyPlan, events);
+    setEditingSubject(null);
+  };
+
+  const handlePlanBlur = async () => {
+    // テキストエリアからフォーカスが外れた時に保存
+    await saveData(subjects, studyPlan, events);
+  };
+  
+  // カレンダー操作・追加関数
+  const handleAddEvent = async (e) => {
+    e.preventDefault();
+    if (!taskInput.trim() || !selectedDate) return;
+    
+    const newEvent = {
+      id: crypto.randomUUID(),
+      date: selectedDate,
+      title: taskInput.trim(),
+    };
+    const newEvents = [...events, newEvent];
+    setEvents(newEvents);
+    await saveData(subjects, studyPlan, newEvents);
+    setTaskInput('');
+  };
+
+  const handleDeleteEvent = async (id) => {
+    const newEvents = events.filter(e => e.id !== id);
+    setEvents(newEvents);
+    await saveData(subjects, studyPlan, newEvents);
+  };
+
+  const nextMonth = () => setCurrentMonth(new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 1));
+  const prevMonth = () => setCurrentMonth(new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 1, 1));
+
+  // カレンダーの日付セル生成ロジック
+  const getCalendarDays = () => {
+    const year = currentMonth.getFullYear();
+    const month = currentMonth.getMonth();
+    const firstDay = new Date(year, month, 1).getDay();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    
+    const days = [];
+    // 前月の空白
+    for (let i = 0; i < firstDay; i++) {
+      days.push(null);
+    }
+    // 今月の日付
+    for (let i = 1; i <= daysInMonth; i++) {
+      days.push(`${year}-${String(month + 1).padStart(2, '0')}-${String(i).padStart(2, '0')}`);
+    }
+    return days;
+  };
+
+  const allTags = useMemo(() => {
+    const tagSet = new Set();
+    subjects.forEach(s => s.tags.forEach(t => tagSet.add(t)));
+    return Array.from(tagSet);
+  }, [subjects]);
+
+  const filteredSubjects = useMemo(() => {
+    if (selectedTag === 'all') return subjects;
+    return subjects.filter(s => s.tags.includes(selectedTag));
+  }, [subjects, selectedTag]);
+
+  const formatNum = (num) => Math.round(num * 100) / 100;
+  
+  const totalScore = formatNum(filteredSubjects.reduce((sum, s) => sum + s.score, 0));
+  const totalAverage = formatNum(filteredSubjects.reduce((sum, s) => sum + s.average, 0));
+  const diff = formatNum(totalScore - totalAverage);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600"></div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-4 md:p-8 text-slate-800 font-sans print:p-0 print:bg-white">
+      <div className="max-w-6xl mx-auto space-y-6 print:space-y-0 print:max-w-none">
+        
+        {/* Header - 印刷時は非表示 */}
+        <header className="bg-white p-5 md:px-8 rounded-2xl shadow-sm border border-slate-200 flex justify-between items-center print:hidden">
+          <h1 className="text-xl md:text-2xl font-extrabold text-slate-800 tracking-tight">Test Score Analyzer</h1>
+          {user && (
+            <div className="flex items-center gap-1.5 text-xs font-medium text-emerald-600 bg-emerald-50 px-3 py-1.5 rounded-full border border-emerald-100">
+              <Cloud size={14} />
+              <span className="hidden sm:inline">クラウド同期中</span>
+            </div>
+          )}
+        </header>
+
+        {/* タブナビゲーション - 印刷時は非表示 */}
+        <div className="flex bg-slate-200 p-1 rounded-xl w-max print:hidden">
+          <button 
+            onClick={() => setActiveTab('dashboard')}
+            className={`px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all ${activeTab === 'dashboard' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+          >
+            <BarChart2 size={16}/> 分析・登録
+          </button>
+          <button 
+            onClick={() => setActiveTab('schedule')}
+            className={`px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all ${activeTab === 'schedule' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+          >
+            <Calendar size={16}/> スケジュール
+          </button>
+          <button 
+            onClick={() => setActiveTab('report')}
+            className={`px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all ${activeTab === 'report' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+          >
+            <FileText size={16}/> レポート作成
+          </button>
+        </div>
+
+        {/* タグフィルター (共通) - 印刷時は非表示 */}
+        {subjects.length > 0 && (
+          <div className="bg-white p-4 sm:p-5 rounded-2xl shadow-sm border border-slate-200 print:hidden">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-bold text-slate-500 flex items-center gap-1 mr-2">
+                <Filter size={16} /> 対象:
+              </span>
+              <button 
+                onClick={() => setSelectedTag('all')}
+                className={`px-4 py-1.5 rounded-xl text-sm font-semibold transition-all ${
+                  selectedTag === 'all' 
+                    ? 'bg-blue-600 text-white shadow-md shadow-blue-200' 
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                }`}
+              >
+                すべて
+              </button>
+              {allTags.map(tag => (
+                <button
+                  key={tag}
+                  onClick={() => setSelectedTag(tag)}
+                  className={`px-4 py-1.5 rounded-xl text-sm font-semibold transition-all ${
+                    selectedTag === tag 
+                      ? 'bg-blue-600 text-white shadow-md shadow-blue-200' 
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  {tag}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        
+        {/* === ダッシュボードビュー === */}
+        {activeTab === 'dashboard' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 print:hidden">
+            
+            {/* 左側コンテンツ */}
+            <div className="lg:col-span-8 space-y-6 flex flex-col">
+              {/* サマリーカード */}
+              <div className="grid grid-cols-3 gap-4">
+                <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200 flex flex-col items-center justify-center">
+                  <div className="text-xs font-bold text-slate-400 mb-1">合計得点</div>
+                  <div className="text-2xl sm:text-3xl font-black text-slate-800">{totalScore}</div>
+                </div>
+                <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200 flex flex-col items-center justify-center">
+                  <div className="text-xs font-bold text-slate-400 mb-1">合計平均</div>
+                  <div className="text-2xl sm:text-3xl font-black text-slate-800">{totalAverage}</div>
+                </div>
+                <div className={`p-5 rounded-2xl shadow-sm border flex flex-col items-center justify-center ${
+                  diff > 0 ? 'bg-blue-50 border-blue-100' : diff < 0 ? 'bg-red-50 border-red-100' : 'bg-white border-slate-200'
+                }`}>
+                  <div className="text-xs font-bold text-slate-500 mb-1">平均との差分</div>
+                  <div className={`text-2xl sm:text-3xl font-black ${
+                    diff > 0 ? 'text-blue-600' : diff < 0 ? 'text-red-600' : 'text-slate-800'
+                  }`}>
+                    {diff > 0 ? '+' : ''}{diff}
+                  </div>
+                </div>
+              </div>
+
+              {/* グラフエリア */}
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex-grow flex flex-col">
+                <div className="flex justify-between items-center mb-6">
+                  <h2 className="text-lg font-bold text-slate-800">成績グラフ</h2>
+                  <div className="flex bg-slate-100 rounded-lg p-1">
+                    <button 
+                      onClick={() => setChartType('bar')} 
+                      className={`p-2 rounded-md transition-all ${chartType === 'bar' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+                      title="棒グラフ"
+                    >
+                      <BarChart2 size={18} />
+                    </button>
+                    <button 
+                      onClick={() => setChartType('radar')} 
+                      className={`p-2 rounded-md transition-all ${chartType === 'radar' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+                      title="レーダーチャート"
+                    >
+                      <Hexagon size={18} />
+                    </button>
+                  </div>
+                </div>
+                <div className="flex-grow w-full h-64 sm:h-80">
+                  <ChartView data={filteredSubjects} type={chartType} />
+                </div>
+              </div>
+            </div>
+
+            {/* 右側コンテンツ */}
+            <div className="lg:col-span-4 space-y-6">
+              
+              {/* 入力フォーム */}
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                <h2 className="text-base font-bold text-slate-800 mb-5 flex items-center gap-2">
+                  <Plus size={18} className="text-blue-600"/> 科目の追加
+                </h2>
+                <form onSubmit={handleAdd} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 mb-1.5">教科名</label>
+                    <input 
+                      type="text" 
+                      required 
+                      value={name} 
+                      onChange={e => setName(e.target.value)} 
+                      className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 transition-colors" 
+                      placeholder="例: 数学I" 
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-500 mb-1.5">点数</label>
+                      <input 
+                        type="number" 
+                        required 
+                        step="0.1" 
+                        value={score} 
+                        onChange={e => setScore(e.target.value)} 
+                        className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-lg" 
+                        placeholder="0" 
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-500 mb-1.5">平均点</label>
+                      <input 
+                        type="number" 
+                        required 
+                        step="0.1" 
+                        value={average} 
+                        onChange={e => setAverage(e.target.value)} 
+                        className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-lg" 
+                        placeholder="0" 
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 mb-1.5">タグ (任意)</label>
+                    <input 
+                      type="text" 
+                      value={tagsInput} 
+                      onChange={e => setTagsInput(e.target.value)} 
+                      className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500" 
+                      placeholder="例: 理系, 主教科" 
+                    />
+                  </div>
+                  <button 
+                    type="submit" 
+                    className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm mt-2"
+                  >
+                    成績を追加する
+                  </button>
+                </form>
+              </div>
+
+              {/* 科目リスト */}
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                <h2 className="text-base font-bold text-slate-800 mb-2">登録済みの科目</h2>
+                <p className="text-xs text-slate-400 mb-4">クリックして範囲や反省点を編集できます</p>
+                <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+                  {filteredSubjects.length === 0 ? (
+                    <p className="text-sm text-slate-400 text-center py-6 bg-slate-50 rounded-xl border border-dashed border-slate-200">
+                      データがありません。
+                    </p>
+                  ) : (
+                    [...filteredSubjects].reverse().map(subject => (
+                      <div 
+                        key={subject.id} 
+                        onClick={() => openEditModal(subject)}
+                        className="relative p-4 border border-slate-100 bg-slate-50 rounded-xl flex flex-col group hover:border-blue-300 hover:bg-blue-50/50 cursor-pointer transition-all"
+                      >
+                        <div className="flex justify-between items-start mb-1 pr-8">
+                          <span className="font-bold text-slate-800">{subject.name}</span>
+                          <span className={`text-sm font-black ${subject.score >= subject.average ? 'text-blue-600' : 'text-slate-600'}`}>
+                            {subject.score}点
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-500 mb-2">
+                          平均: {subject.average}点 <span className="mx-1">|</span> 差: {formatNum(subject.score - subject.average) > 0 ? '+' : ''}{formatNum(subject.score - subject.average)}
+                        </div>
+                        {subject.tags.length > 0 && (
+                          <div className="flex gap-1.5 flex-wrap">
+                            {subject.tags.map((t, i) => (
+                              <span key={i} className="text-[10px] font-medium bg-white border border-slate-200 text-slate-500 px-2 py-0.5 rounded-lg shadow-sm">
+                                {t}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {(subject.range || subject.reflection) && (
+                          <div className="mt-2 text-[11px] text-slate-400 flex items-center gap-1">
+                            <FileText size={12}/> メモあり
+                          </div>
+                        )}
+                        <div className="absolute top-3 right-10 text-blue-500 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <Edit2 size={16} />
+                        </div>
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); handleDelete(subject.id); }} 
+                          className="absolute top-2 right-2 p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors md:opacity-0 md:group-hover:opacity-100 focus:opacity-100"
+                          title="削除"
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+              
+            </div>
+          </div>
+        )}
+
+        {/* === スケジュールビュー === */}
+        {activeTab === 'schedule' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            
+            {/* 左側: スケジュール作成支援ツール */}
+            <div className="lg:col-span-4 space-y-6 print:hidden">
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 sticky top-6">
+                <h2 className="text-base font-bold text-slate-800 mb-5 flex items-center gap-2">
+                  <Calendar size={18} className="text-blue-600"/> 予定のクイック追加
+                </h2>
+                
+                <div className="mb-4 p-3 bg-blue-50 border border-blue-100 rounded-xl">
+                  <span className="text-xs font-bold text-blue-600 block mb-1">選択中の日付</span>
+                  <span className="text-lg font-black text-slate-800">
+                    {selectedDate ? new Date(selectedDate).toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' }) : '日付を選択してください'}
+                  </span>
+                </div>
+
+                <form onSubmit={handleAddEvent} className="space-y-5">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 mb-2">タスク内容</label>
+                    <input 
+                      type="text" 
+                      required 
+                      value={taskInput} 
+                      onChange={e => setTaskInput(e.target.value)} 
+                      className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500" 
+                      placeholder="例: 数学 ワークp10-12" 
+                    />
+                  </div>
+
+                  {/* 入力支援ボタン群 */}
+                  <div className="space-y-3 pt-2">
+                    <div>
+                      <span className="text-[10px] font-bold text-slate-400 block mb-1.5">科目から入力</span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {subjects.length === 0 && <span className="text-xs text-slate-400">科目を登録してください</span>}
+                        {subjects.map(s => (
+                          <button 
+                            key={s.id} type="button"
+                            onClick={() => setTaskInput(prev => prev ? `${prev} ${s.name}` : s.name)}
+                            className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-2.5 py-1.5 rounded-lg border border-slate-200 transition-colors"
+                          >
+                            {s.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <span className="text-[10px] font-bold text-slate-400 block mb-1.5">よく使うキーワード</span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {['ワーク', 'プリント', '暗記', '復習', '過去問', 'テスト'].map(word => (
+                          <button 
+                            key={word} type="button"
+                            onClick={() => setTaskInput(prev => prev ? `${prev} ${word}` : word)}
+                            className="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 px-2.5 py-1.5 rounded-lg border border-emerald-200 transition-colors"
+                          >
+                            {word}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <button 
+                    type="submit" 
+                    disabled={!selectedDate}
+                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-bold py-3 rounded-xl transition-colors shadow-sm mt-4"
+                  >
+                    この日に追加
+                  </button>
+                </form>
+              </div>
+            </div>
+
+            {/* 右側: カレンダー本体 */}
+            <div className="lg:col-span-8 bg-white p-4 sm:p-6 rounded-2xl shadow-sm border border-slate-200 print:border-none print:shadow-none print:col-span-12 print:p-0">
+              
+              {/* カレンダーヘッダー */}
+              <div className="flex justify-between items-center mb-6">
+                <div className="flex items-center gap-4 print:hidden">
+                  <button onClick={prevMonth} className="p-2 hover:bg-slate-100 rounded-full text-slate-600 transition-colors"><ChevronLeft size={20}/></button>
+                  <h3 className="text-xl font-bold text-slate-800">{currentMonth.getFullYear()}年 {currentMonth.getMonth() + 1}月</h3>
+                  <button onClick={nextMonth} className="p-2 hover:bg-slate-100 rounded-full text-slate-600 transition-colors"><ChevronRight size={20}/></button>
+                </div>
+                <h3 className="text-2xl font-black text-slate-800 hidden print:block">{currentMonth.getFullYear()}年 {currentMonth.getMonth() + 1}月 スケジュール</h3>
+                <button onClick={() => window.print()} className="print:hidden flex items-center gap-2 bg-slate-100 text-slate-600 hover:bg-slate-200 px-4 py-2 rounded-xl text-sm font-bold transition-colors">
+                  <Printer size={16} /> カレンダーを印刷
+                </button>
+              </div>
+
+              {/* カレンダーグリッド */}
+              <div className="grid grid-cols-7 gap-px bg-slate-200 border border-slate-200 rounded-xl overflow-hidden print:border-slate-800 print:bg-slate-800 print:gap-px">
+                {['日', '月', '火', '水', '木', '金', '土'].map(day => (
+                  <div key={day} className="bg-slate-50 text-center py-2 text-xs font-bold text-slate-500 print:bg-white print:text-black">
+                    {day}
+                  </div>
+                ))}
+                
+                {getCalendarDays().map((dateString, index) => {
+                  const isToday = dateString === `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+                  const isSelected = dateString === selectedDate;
+                  const dayEvents = dateString ? events.filter(e => e.date === dateString) : [];
+
+                  return (
+                    <div 
+                      key={index}
+                      onClick={() => dateString && setSelectedDate(dateString)}
+                      className={`min-h-[100px] sm:min-h-[120px] bg-white p-1 sm:p-2 cursor-pointer transition-colors relative print:min-h-[120px]
+                        ${!dateString ? 'bg-slate-50/50 cursor-default print:bg-slate-100' : 'hover:bg-blue-50/50 print:bg-white'}
+                        ${isSelected ? 'ring-2 ring-inset ring-blue-500 bg-blue-50/20' : ''}
+                      `}
+                    >
+                      {dateString && (
+                        <>
+                          <div className={`text-xs font-bold mb-1 w-6 h-6 flex items-center justify-center rounded-full
+                            ${isToday ? 'bg-blue-600 text-white print:bg-transparent print:text-black print:border-2 print:border-black' : 'text-slate-600'}
+                          `}>
+                            {parseInt(dateString.split('-')[2], 10)}
+                          </div>
+                          
+                          <div className="space-y-1">
+                            {dayEvents.map(event => (
+                              <div key={event.id} className="group relative bg-blue-50 border border-blue-100 text-blue-800 text-[10px] sm:text-xs rounded px-1.5 py-1 leading-tight break-words print:bg-white print:border-slate-300 print:text-black">
+                                {event.title}
+                                <button 
+                                  onClick={(e) => { e.stopPropagation(); handleDeleteEvent(event.id); }}
+                                  className="absolute top-0.5 right-0.5 text-blue-400 hover:text-red-500 bg-white rounded-full p-0.5 opacity-0 group-hover:opacity-100 transition-opacity print:hidden"
+                                >
+                                  <X size={10} />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* === レポート・計画ビュー === */}
+        {activeTab === 'report' && (
+          <div className="bg-white p-6 sm:p-10 rounded-2xl shadow-sm border border-slate-200 print:border-none print:shadow-none print:p-0">
+            
+            {/* レポート画面のアクションバー */}
+            <div className="flex justify-between items-center mb-8 pb-4 border-b border-slate-100 print:hidden">
+              <div>
+                <h2 className="text-2xl font-bold text-slate-800">成績と学習計画レポート</h2>
+                <p className="text-sm text-slate-500 mt-1">印刷して保存したり、壁に貼って目標にしましょう</p>
+              </div>
+              <button 
+                onClick={() => window.print()} 
+                className="flex items-center gap-2 bg-slate-800 text-white px-5 py-2.5 rounded-xl hover:bg-slate-700 font-bold text-sm transition-colors shadow-sm"
+              >
+                <Printer size={18} /> レポートを印刷
+              </button>
+            </div>
+
+            {/* 印刷用ヘッダー (画面上でも表示されるが、印刷時に見栄えが良くなる) */}
+            <div className="mb-10 text-center">
+              <h1 className="text-3xl font-black text-slate-800 mb-2 border-b-2 border-slate-800 inline-block pb-1">成績・学習計画レポート</h1>
+              <div className="text-slate-500 font-medium flex justify-center gap-6 mt-3">
+                <span>作成日: {new Date().toLocaleDateString()}</span>
+                {selectedTag !== 'all' && <span>対象グループ: {selectedTag}</span>}
+              </div>
+            </div>
+
+            {/* チャート */}
+            {filteredSubjects.length > 0 && (
+              <div className="mb-12 break-inside-avoid">
+                <h3 className="text-lg font-bold border-l-4 border-blue-500 pl-3 mb-6 text-slate-800">成績バランス</h3>
+                <div className="w-full max-w-2xl mx-auto h-80 sm:h-96">
+                  <ChartView data={filteredSubjects} type="radar" />
+                </div>
+              </div>
+            )}
+
+            {/* 成績一覧と反省点 */}
+            <div className="mb-12">
+              <h3 className="text-lg font-bold border-l-4 border-blue-500 pl-3 mb-6 text-slate-800">成績一覧と反省点</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse min-w-[600px]">
+                  <thead>
+                    <tr className="bg-slate-100 text-sm text-slate-600 border-b-2 border-slate-300">
+                      <th className="p-3 font-bold w-[12%]">教科</th>
+                      <th className="p-3 font-bold w-[8%]">点数</th>
+                      <th className="p-3 font-bold w-[8%]">平均</th>
+                      <th className="p-3 font-bold w-[8%]">差</th>
+                      <th className="p-3 font-bold w-[24%]">テスト範囲</th>
+                      <th className="p-3 font-bold w-[40%]">反省点・気づき</th>
+                    </tr>
+                  </thead>
+                  <tbody className="text-sm align-top">
+                    {filteredSubjects.map((s, index) => (
+                      <tr key={s.id} className={`border-b border-slate-200 break-inside-avoid ${index % 2 === 0 ? 'bg-white' : 'bg-slate-50'}`}>
+                        <td className="p-3 font-bold text-slate-800">{s.name}</td>
+                        <td className="p-3 font-mono text-base font-semibold">{s.score}</td>
+                        <td className="p-3 font-mono text-slate-500">{s.average}</td>
+                        <td className={`p-3 font-mono font-bold ${s.score - s.average > 0 ? 'text-blue-600' : s.score - s.average < 0 ? 'text-red-600' : ''}`}>
+                          {s.score - s.average > 0 ? '+' : ''}{formatNum(s.score - s.average)}
+                        </td>
+                        <td className="p-3 whitespace-pre-wrap text-slate-600 text-xs leading-relaxed">{s.range || '-'}</td>
+                        <td className="p-3 whitespace-pre-wrap text-slate-700 text-xs leading-relaxed">{s.reflection || '-'}</td>
+                      </tr>
+                    ))}
+                    {filteredSubjects.length === 0 && (
+                      <tr><td colSpan="6" className="p-6 text-center text-slate-400">データがありません</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* 今後の学習計画 */}
+            <div className="break-inside-avoid">
+              <h3 className="text-lg font-bold border-l-4 border-emerald-500 pl-3 mb-4 text-slate-800 flex items-center gap-2">
+                <CheckSquare size={20} className="text-emerald-500"/> 今回の反省を活かした今後の学習計画
+              </h3>
+              <textarea 
+                value={studyPlan}
+                onChange={e => setStudyPlan(e.target.value)}
+                onBlur={handlePlanBlur}
+                placeholder="例: 数学は計算ミスが目立ったので、毎日計算ドリルを1ページ解く。英語は単語の暗記が足りなかったので、通学時間に必ず単語帳を開くようにする..."
+                className="w-full min-h-[200px] p-5 bg-emerald-50/30 border border-emerald-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:bg-white resize-y text-slate-700 leading-relaxed print:border-2 print:border-slate-800 print:bg-white print:resize-none print:text-black"
+              />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* === 編集モーダル === */}
+      {editingSubject && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex justify-center items-center p-4 print:hidden animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl w-full max-w-2xl shadow-2xl flex flex-col max-h-[90vh]">
+            <div className="flex justify-between items-center p-5 border-b border-slate-100">
+              <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                <Edit2 size={18} className="text-blue-600"/> 科目データの編集
+              </h3>
+              <button onClick={() => setEditingSubject(null)} className="text-slate-400 hover:text-slate-700 p-1 bg-slate-100 rounded-full">
+                <X size={20} />
+              </button>
+            </div>
+            
+            <form onSubmit={handleUpdate} className="p-6 overflow-y-auto custom-scrollbar space-y-5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1.5">教科名</label>
+                  <input 
+                    type="text" required value={editForm.name} 
+                    onChange={e => setEditForm({...editForm, name: e.target.value})} 
+                    className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500" 
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1.5">タグ (カンマ区切り)</label>
+                  <input 
+                    type="text" value={editForm.tagsInput} 
+                    onChange={e => setEditForm({...editForm, tagsInput: e.target.value})} 
+                    className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500" 
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1.5">あなたの点数</label>
+                  <input 
+                    type="number" required step="0.1" value={editForm.score} 
+                    onChange={e => setEditForm({...editForm, score: e.target.value})} 
+                    className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 font-mono text-lg" 
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1.5">平均点</label>
+                  <input 
+                    type="number" required step="0.1" value={editForm.average} 
+                    onChange={e => setEditForm({...editForm, average: e.target.value})} 
+                    className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 font-mono text-lg" 
+                  />
+                </div>
+              </div>
+
+              <div className="pt-4 border-t border-slate-100">
+                <label className="block text-xs font-bold text-slate-500 mb-1.5">テスト範囲 (任意)</label>
+                <textarea 
+                  value={editForm.range} 
+                  onChange={e => setEditForm({...editForm, range: e.target.value})} 
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 h-20 resize-y text-sm" 
+                  placeholder="例: 教科書 p.40 ~ p.85、ワーク 第2章" 
+                />
+              </div>
+              
+              <div>
+                <label className="block text-xs font-bold text-slate-500 mb-1.5">反省点・メモ (任意)</label>
+                <textarea 
+                  value={editForm.reflection} 
+                  onChange={e => setEditForm({...editForm, reflection: e.target.value})} 
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 h-28 resize-y text-sm" 
+                  placeholder="例: 計算ミスが3問もあった。見直しの時間が足りなかったので、次回はペース配分に気をつける。" 
+                />
+              </div>
+              
+              <div className="pt-2">
+                <button type="submit" className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3.5 rounded-xl transition-colors shadow-sm">
+                  変更を保存する
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* スタイル定義 (カスタムスクロールバーと印刷時の詳細設定) */}
+      <style dangerouslySetInnerHTML={{__html: `
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 20px; }
+        
+        @media print {
+          body {
+            background-color: white !important;
+            -webkit-print-color-adjust: exact !important;
+            print-color-adjust: exact !important;
+          }
+          @page {
+            margin: 1cm;
+            size: A4 portrait;
+          }
+          textarea {
+            overflow: visible !important;
+          }
+          .print\\:min-h-\\[120px\\] {
+            min-height: 120px !important;
+          }
+        }
+      `}} />
+    </div>
+  );
+}
