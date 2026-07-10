@@ -311,58 +311,23 @@
         if (savedData) {
           try {
             const parsed = JSON.parse(savedData);
-            let loadedTests = [];
-            let loadedEvents = parsed.events || [];
-            let needsSave = false;
-
-            // 新しい形式 (tests配列がある)
             if (parsed.tests) {
-              loadedTests = parsed.tests;
-            } 
-            // 古い形式 (subjects配列が直にある) からの移行
-            else if (parsed.subjects) {
-              if (parsed.subjects.length > 0) {
-                const migratedTest = {
-                  id: crypto.randomUUID(),
-                  title: '過去のテストデータ',
-                  date: todayStr,
-                  tags: ['移行データ'],
-                  isSelfScoringEnabled: false,
-                  subjects: parsed.subjects,
-                  studyPlan: parsed.studyPlan || ''
-                };
-                loadedTests = [migratedTest];
-              }
-              needsSave = true; // 新形式に変換したので保存フラグを立てる
+              setTests(parsed.tests);
+            } else if (parsed.subjects && parsed.subjects.length > 0) {
+              // 古いデータ形式からのマイグレーション
+              const migratedTest = {
+                id: crypto.randomUUID(),
+                title: '過去のテストデータ',
+                date: todayStr,
+                tags: ['移行データ'],
+                subjects: parsed.subjects,
+                studyPlan: parsed.studyPlan || ''
+              };
+              setTests([migratedTest]);
             }
-
-            // データの欠落を防ぐための安全なフォーマット処理 (エラー防止)
-            loadedTests = loadedTests.map(test => ({
-              ...test,
-              tags: test.tags || [],
-              subjects: (test.subjects || []).map(subject => ({
-                ...subject,
-                tags: subject.tags || [],
-                score: Number(subject.score) || 0,
-                average: Number(subject.average) || 0,
-              }))
-            }));
-
-            setTests(loadedTests);
-            setEvents(loadedEvents);
-
-            // マイグレーションが発生した場合は新しい形式でローカルストレージをすぐに上書き
-            if (needsSave) {
-              localStorage.setItem(STORAGE_KEY, JSON.stringify({
-                tests: loadedTests,
-                events: loadedEvents
-              }));
-            }
+            setEvents(parsed.events || []);
           } catch (e) {
             console.error("データの読み込みに失敗しました", e);
-            // 壊れたデータが原因でクラッシュするのを防ぐ
-            setTests([]);
-            setEvents([]);
           }
         }
         setLoading(false);
@@ -996,21 +961,12 @@
                   <h3 className="text-lg font-bold border-l-4 border-emerald-500 pl-3 mb-4 text-slate-800 flex items-center gap-2">
                     <CheckSquare size={20} className="text-emerald-500"/> 今後の学習計画
                   </h3>
-                  {/* 画面入力用 (入力に合わせて自動で高さが変わる) */}
                   <textarea 
                     value={activeTest.studyPlan || ''}
                     onChange={e => updateActiveTest({ studyPlan: e.target.value })}
-                    onInput={e => {
-                      e.target.style.height = 'auto';
-                      e.target.style.height = e.target.scrollHeight + 'px';
-                    }}
                     placeholder="このテストの反省を活かした今後の計画を書きましょう..."
-                    className="w-full min-h-[200px] p-5 bg-emerald-50/30 border border-emerald-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:bg-white resize-none text-slate-700 leading-relaxed print:hidden overflow-hidden"
+                    className="w-full min-h-[200px] p-5 bg-emerald-50/30 border border-emerald-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:bg-white resize-y text-slate-700 leading-relaxed print:border-2 print:border-slate-800 print:bg-white print:resize-none print:text-black"
                   />
-                  {/* 印刷用 (長文でも絶対途切れないようにdivで表示) */}
-                  <div className="hidden print:block w-full min-h-[200px] p-5 border-2 border-slate-800 bg-white rounded-xl text-black whitespace-pre-wrap leading-relaxed break-words">
-                    {activeTest.studyPlan || ''}
-                  </div>
                 </div>
               </div>
             )}
