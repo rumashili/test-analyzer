@@ -183,11 +183,14 @@
         if (chartInstance.current) chartInstance.current.destroy();
 
         // 日付でソート
-        const sortedTests = [...tests].sort((a, b) => new Date(a.date) - new Date(b.date));
+        const sortedTests = [...tests].sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
         
-        const labels = sortedTests.map(t => t.title.length > 10 ? t.title.substring(0, 10) + '...' : t.title);
-        const totalScores = sortedTests.map(t => t.subjects.reduce((sum, s) => sum + s.score, 0));
-        const totalAverages = sortedTests.map(t => t.subjects.reduce((sum, s) => sum + s.average, 0));
+        const labels = sortedTests.map(t => {
+          const title = t.title || '無題のテスト';
+          return title.length > 10 ? title.substring(0, 10) + '...' : title;
+        });
+        const totalScores = sortedTests.map(t => (t.subjects || []).reduce((sum, s) => sum + (Number(s.score) || 0), 0));
+        const totalAverages = sortedTests.map(t => (t.subjects || []).reduce((sum, s) => sum + (Number(s.average) || 0), 0));
 
         const ctx = chartRef.current.getContext('2d');
         const config = {
@@ -311,21 +314,38 @@
         if (savedData) {
           try {
             const parsed = JSON.parse(savedData);
-            if (parsed.tests) {
-              setTests(parsed.tests);
-            } else if (parsed.subjects && parsed.subjects.length > 0) {
+            let loadedTests = [];
+            
+            if (parsed.tests && Array.isArray(parsed.tests)) {
+              loadedTests = parsed.tests;
+            } else if (parsed.subjects && Array.isArray(parsed.subjects) && parsed.subjects.length > 0) {
               // 古いデータ形式からのマイグレーション
               const migratedTest = {
                 id: crypto.randomUUID(),
                 title: '過去のテストデータ',
                 date: todayStr,
                 tags: ['移行データ'],
+                isSelfScoringEnabled: false,
                 subjects: parsed.subjects,
                 studyPlan: parsed.studyPlan || ''
               };
-              setTests([migratedTest]);
+              loadedTests = [migratedTest];
             }
-            setEvents(parsed.events || []);
+
+            // 安全のためのデータ整形 (欠落しているプロパティを自動補完・修正)
+            const safeTests = loadedTests.map(t => ({
+              ...t,
+              id: t.id || crypto.randomUUID(),
+              title: t.title || '無題のテスト',
+              date: t.date || todayStr,
+              tags: Array.isArray(t.tags) ? t.tags : [],
+              subjects: Array.isArray(t.subjects) ? t.subjects : [],
+              isSelfScoringEnabled: !!t.isSelfScoringEnabled,
+              studyPlan: t.studyPlan || ''
+            }));
+
+            setTests(safeTests);
+            setEvents(Array.isArray(parsed.events) ? parsed.events : []);
           } catch (e) {
             console.error("データの読み込みに失敗しました", e);
           }
@@ -658,8 +678,8 @@
                     テストがまだありません。左のフォームから追加してください。
                   </div>
                 ) : (
-                  [...filteredTests].sort((a,b)=> new Date(b.date) - new Date(a.date)).map(test => {
-                    const testTotal = test.subjects.reduce((sum, s) => sum + s.score, 0);
+                  [...filteredTests].sort((a,b)=> new Date(b.date || 0) - new Date(a.date || 0)).map(test => {
+                    const testTotal = (test.subjects || []).reduce((sum, s) => sum + (Number(s.score) || 0), 0);
                     return (
                       <div 
                         key={test.id} 
@@ -687,8 +707,8 @@
                         </div>
                         
                         <div className="flex items-center text-xs text-slate-500 mb-4 gap-4">
-                          <span className="flex items-center gap-1"><Calendar size={14}/> {test.date}</span>
-                          <span className="flex items-center gap-1"><FileText size={14}/> {test.subjects.length}教科</span>
+                          <span className="flex items-center gap-1"><Calendar size={14}/> {test.date || '未定'}</span>
+                          <span className="flex items-center gap-1"><FileText size={14}/> {(test.subjects || []).length}教科</span>
                         </div>
 
                         {(test.tags && test.tags.length > 0) && (
